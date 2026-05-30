@@ -1,0 +1,317 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+---
+title: "Rozdział 3 – Analiza poziomu militaryzacji państw"
+author: "Julita Kwiatkowska"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 0. Biblioteki i dane
+
+```{r}
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(ggrepel)
+library(factoextra)
+library(topsis)
+library(knitr)
+library(kableExtra)
+library(corrplot)
+
+data <- read_excel("~/Desktop/praca licen/daneshiny.xlsx")
+
+raw_matrix <- data %>%
+  select(Country,
+         `Military expenditure`,
+         `Military personal`,
+         `Heavy weapons`) %>%
+  na.omit()
+```
+
+## 3.1 Statystyki opisowe zmiennych diagnostycznych
+
+```{r}
+stats_tabela <- raw_matrix %>%
+  summarise(across(where(is.numeric), list(
+    Srednia = mean,
+    SD      = sd,
+    Min     = min,
+    Max     = max,
+    CV      = ~round((sd(.) / mean(.)) * 100, 2)
+  ))) %>%
+  tidyr::pivot_longer(everything(),
+                      names_to  = c("Zmienna", "Statystyka"),
+                      names_sep = "_") %>%
+  tidyr::pivot_wider(names_from = Statystyka, values_from = value)
+
+kable(stats_tabela,
+      caption = "Tabela 1. Statystyki opisowe zmiennych diagnostycznych",
+      digits  = 3,
+      booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r}
+macierz_kor <- cor(raw_matrix[, -1], use = "complete.obs")
+
+corrplot(macierz_kor,
+         method      = "color",
+         type        = "upper",
+         addCoef.col = "black",
+         tl.col      = "black",
+         tl.srt      = 45,
+         col         = colorRampPalette(c("#d73027", "white", "#1a9850"))(200),
+         title       = "Macierz korelacji zmiennych diagnostycznych",
+         mar         = c(0, 0, 2, 0))
+```
+
+## 3.2 Porządkowanie liniowe metodą TOPSIS
+
+### 3.2.1 Założenia i parametryzacja modelu
+
+#### Obliczenie wag metodą współczynnika zmienności (CV)
+
+```{r}
+cv      <- apply(raw_matrix[, -1], 2, function(x) sd(x) / mean(x))
+wagi_cv <- cv / sum(cv)
+
+kable(data.frame(
+        Zmienna = c("Military expenditure",
+                    "Military personal",
+                    "Heavy weapons"),
+        CV      = round(cv, 4),
+        Waga    = round(wagi_cv, 4)
+      ),
+      caption  = "Tabela 2. Wagi zmiennych wyznaczone metodą CV",
+      booktabs = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+#### Normalizacja unitarna (0–1)
+
+```{r}
+norm_data <- raw_matrix %>%
+  mutate(across(where(is.numeric),
+                ~ (. - min(.)) / (max(.) - min(.))))
+```
+
+### 3.2.2 Analiza wyników rankingu TOPSIS
+
+```{r}
+results <- topsis(
+  as.matrix(norm_data[, -1]),
+  wagi_cv,          # wagi CV zamiast równych
+  c("+", "+", "+")
+)
+
+ranking_topsis <- data.frame(
+  Country    = norm_data$Country,
+  Miernik_Si = round(results$score, 4),
+  Ranking    = results$rank
+) %>%
+  arrange(Ranking)
+```
+
+#### TOP 20 najbardziej zmilitaryzowanych państw
+
+```{r}
+kable(head(ranking_topsis, 20),
+      col.names = c("Państwo", "Wskaźnik C*", "Pozycja TOPSIS"),
+      caption   = "Tabela 3. Top 20 państw według wskaźnika TOPSIS",
+      booktabs  = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(0, bold = TRUE, background = "#2c3e50", color = "white")
+```
+
+#### 10 najmniej zmilitaryzowanych państw
+
+```{r}
+kable(tail(ranking_topsis, 10),
+      col.names = c("Państwo", "Wskaźnik C*", "Pozycja TOPSIS"),
+      caption   = "Tabela 4. 10 najmniej zmilitaryzowanych państw",
+      booktabs  = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+#### Wykres — Top 20
+
+```{r fig.width=9, fig.height=6}
+ranking_topsis %>%
+  head(20) %>%
+  mutate(Country = reorder(Country, Miernik_Si)) %>%
+  ggplot(aes(x = Miernik_Si, y = Country)) +
+  geom_col(fill = "#2c3e50", alpha = 0.85) +
+  geom_text(aes(label = Miernik_Si), hjust = -0.1, size = 3.5) +
+  labs(title = "Top 20 najbardziej zmilitaryzowanych państw (TOPSIS)",
+       x     = "Wskaźnik C*",
+       y     = NULL) +
+  theme_minimal(base_size = 13) +
+  xlim(0, max(ranking_topsis$Miernik_Si) * 1.12)
+```
+
+## 3.3 Analiza porównawcza rankingu TOPSIS i GMI
+
+```{r}
+comparison <- ranking_topsis %>%
+  left_join(
+    data %>% select(Country,
+                    GMI_rank  = `GMI rank`,
+                    GMI_score = `GMI score`),
+    by = "Country"
+  ) %>%
+  mutate(Roznica = abs(Ranking - GMI_rank))
+```
+
+### Korelacja Spearmana
+
+```{r}
+cor_test <- cor.test(comparison$Ranking,
+                     comparison$GMI_rank,
+                     method = "spearman")
+
+cat(sprintf("Korelacja Spearmana: rho = %.4f\n",
+            cor_test$estimate))
+cat(sprintf("p-value = %e\n",
+            cor_test$p.value))
+cat(sprintf("Korelacja jest %s na poziomie α = 0.05\n",
+            ifelse(cor_test$p.value < 0.05,
+                   "ISTOTNA STATYSTYCZNIE", "NIEISTOTNA")))
+```
+
+### Wykres porównawczy rankingów
+
+```{r fig.width=9, fig.height=7}
+# Etykiety tylko dla krajów z dużą różnicą rang
+etykiety <- comparison %>% filter(Roznica > 30)
+
+ggplot(comparison, aes(GMI_rank, Ranking)) +
+  geom_point(aes(color = Roznica), alpha = 0.7, size = 2.5) +
+  geom_abline(linetype = "dashed", color = "red") +
+  geom_label_repel(data      = etykiety,
+                   aes(label = Country),
+                   size      = 3,
+                   max.overlaps = 20) +
+  scale_color_gradient(low = "steelblue", high = "firebrick",
+                       name = "Różnica rang") +
+  labs(title    = "Porównanie rankingów TOPSIS i GMI",
+       subtitle = sprintf("Korelacja Spearmana: ρ = %.3f",
+                          cor_test$estimate),
+       x        = "Ranking GMI",
+       y        = "Ranking TOPSIS") +
+  theme_minimal(base_size = 13)
+```
+
+### Kraje z największymi różnicami rang
+
+```{r}
+comparison %>%
+  arrange(desc(Roznica)) %>%
+  select(Country, Ranking, GMI_rank, Roznica) %>%
+  head(15) %>%
+  kable(col.names = c("Państwo", "Poz. TOPSIS",
+                      "Poz. GMI", "Różnica rang"),
+        caption   = "Tabela 5. Kraje z największą rozbieżnością rankingów",
+        booktabs  = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## 3.4 Analiza skupień metodą k-średnich
+
+### 3.4.1 Wybór optymalnej liczby skupień
+
+```{r fig.width=8, fig.height=5}
+cluster_data <- scale(as.matrix(raw_matrix[, -1]))
+
+fviz_nbclust(cluster_data, kmeans,
+             method = "wss", k.max = 10, nstart = 25) +
+  geom_vline(xintercept = 4, linetype = "dashed", color = "red") +
+  labs(title = "Metoda łokcia",
+       x     = "Liczba klastrów",
+       y     = "WSS") +
+  theme_minimal()
+```
+
+```{r fig.width=8, fig.height=5}
+fviz_nbclust(cluster_data, kmeans,
+             method = "silhouette", k.max = 10, nstart = 25) +
+  labs(title = "Metoda sylwetki") +
+  theme_minimal()
+```
+
+### 3.4.2 K-means i profilowanie klastrów
+
+```{r}
+set.seed(123)
+km <- kmeans(cluster_data, centers = 4, nstart = 25)
+
+profilowanie <- raw_matrix %>%
+  mutate(Cluster = km$cluster) %>%
+  group_by(Cluster) %>%
+  summarise(
+    N             = n(),
+    Sr_wydatki    = round(mean(`Military expenditure`), 3),
+    Sr_personel   = round(mean(`Military personal`), 3),
+    Sr_uzbrojenie = round(mean(`Heavy weapons`), 3),
+    .groups       = "drop"
+  )
+
+kable(profilowanie,
+      col.names = c("Skupienie", "n", "Śr. wydatki",
+                    "Śr. personel", "Śr. uzbrojenie"),
+      caption   = "Tabela 6. Profilowanie skupień k-średnich",
+      booktabs  = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Wizualizacja skupień (PCA)
+
+```{r fig.width=10, fig.height=7}
+fviz_cluster(km,
+             data         = cluster_data,
+             palette      = c("#e74c3c", "#3498db", "#2ecc71", "#f39c12"),
+             geom         = "point",
+             ellipse.type = "convex",
+             main         = "Typologia państw wg poziomu militaryzacji (k = 4)") +
+  theme_minimal()
+```
+
+### Lista krajów w skupieniach
+
+```{r}
+raw_matrix %>%
+  mutate(Cluster = km$cluster) %>%
+  arrange(Cluster, Country) %>%
+  group_by(Cluster) %>%
+  summarise(Kraje   = paste(Country, collapse = ", "),
+            .groups = "drop") %>%
+  kable(col.names = c("Skupienie", "Kraje"),
+        caption   = "Tabela 7. Lista krajów w skupieniach",
+        booktabs  = TRUE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width        = TRUE)
+```
+
+## Zapis wyników
+
+```{r}
+final <- ranking_topsis %>%
+  mutate(Cluster = km$cluster[match(Country, raw_matrix$Country)]) %>%
+  left_join(data %>% select(Country, GMI_rank = `GMI rank`),
+            by = "Country")
+
+write.csv(final, "wyniki_rozdzial3.csv",
+          row.names = FALSE)
+cat("Wyniki zapisane do wyniki_rozdzial3.csv\n")
+```
