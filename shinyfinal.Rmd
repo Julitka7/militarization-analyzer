@@ -1,0 +1,281 @@
+---
+title: "Interaktywny Analizator Militaryzacji (GMI + TOPSIS)"
+author: "Julita Kwiatkowska"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+```{r biblioteki, include=FALSE}
+if (!require("shiny"))       install.packages("shiny")
+if (!require("ggplot2"))     install.packages("ggplot2")
+if (!require("dplyr"))       install.packages("dplyr")
+if (!require("readxl"))      install.packages("readxl")
+if (!require("shinythemes")) install.packages("shinythemes")
+if (!require("leaflet"))     install.packages("leaflet")
+if (!require("maps"))        install.packages("maps")
+if (!require("sf"))          install.packages("sf")
+if (!require("topsis"))      install.packages("topsis")
+
+library(shiny);   library(ggplot2); library(dplyr)
+library(readxl);  library(shinythemes)
+library(leaflet); library(maps);    library(sf)
+library(topsis)
+```
+
+```{r dane, include=FALSE}
+dane <- read_excel("~/Desktop/praca licen/daneshiny.xlsx")
+colnames(dane) <- make.names(colnames(dane))
+
+# Naprawa kolumny trend (tekst przez "-" przy Swazilandzie)
+dane$GMI.score.trend <- as.numeric(dane$GMI.score.trend)
+dane <- dane %>%
+  mutate(across(where(is.numeric), ~ round(., 2)))
+
+# Macierz do TOPSIS — 3 zmienne diagnostyczne
+raw_matrix <- dane %>%
+  select(Country, Military.expenditure, Military.personal, Heavy.weapons) %>%
+  na.omit()
+
+# Wagi CV — wartości startowe dla suwaków
+cv      <- apply(raw_matrix[, -1], 2, function(x) sd(x) / mean(x))
+wagi_cv <- round(cv / sum(cv), 2)
+
+world_sf <- sf::st_as_sf(maps::map("world", plot = FALSE, fill = TRUE))
+```
+
+```{r aplikacja}
+ui <- fluidPage(
+  theme = shinytheme("flatly"),
+  titlePanel("Interaktywny Analizator Militaryzacji (GMI + TOPSIS)"),
+  sidebarLayout(
+    sidebarPanel(
+      h4("Parametry analizy"),
+
+      # ---- BLOK STERUJĄCY GMI ----
+      div(style = "background-color:#eaf2f8; padding:12px; border-radius:8px; margin-bottom:15px;",
+          h5(strong("📊 Sterowanie GMI"),
+             style = "color:#1a5276; margin-top:0;"),
+          p(em("Poniższe kontrolki sterują zakładkami GMI."),
+            style = "font-size:12px; color:#555;"),
+          selectInput("wskaznik", "Wybierz wskaźnik:",
+                      choices = c("GMI Score"          = "GMI.score",
+                                  "Wydatki wojskowe"    = "Military.expenditure",
+                                  "Personel"            = "Military.personal",
+                                  "Ciężkie uzbrojenie"  = "Heavy.weapons"))
+      ),
+
+      # ---- WSPÓLNE ----
+      sliderInput("liczba", "Liczba państw (wspólne dla map i rankingów):",
+                  min = 5, max = 149, value = 20),
+
+      # ---- BLOK STERUJĄCY TOPSIS ----
+      div(style = "background-color:#fdf2e9; padding:12px; border-radius:8px; margin-top:15px;",
+          h5(strong("⚖️ Sterowanie TOPSIS — wagi"),
+             style = "color:#a04000; margin-top:0;"),
+          p(em("Poniższe suwaki sterują zakładkami TOPSIS."),
+            style = "font-size:12px; color:#555;"),
+          sliderInput("w_exp",  "Wydatki wojskowe:",
+                      min = 0, max = 1, value = wagi_cv[1], step = 0.01),
+          sliderInput("w_pers", "Personel wojskowy:",
+                      min = 0, max = 1, value = wagi_cv[2], step = 0.01),
+          sliderInput("w_weap", "Ciężkie uzbrojenie:",
+                      min = 0, max = 1, value = wagi_cv[3], step = 0.01)
+      ),
+
+      br(),
+      p("Aplikacja stworzona na potrzeby pracy licencjackiej.",
+        style = "font-size:12px; color:#777;")
+    ),
+    mainPanel(
+      tabsetPanel(
+        # ---- PARA 1: MAPY ----
+        tabPanel("🗺️ Mapa GMI",      leafletOutput("mapa", height = 600)),
+        tabPanel("🗺️ Mapa TOPSIS",   leafletOutput("mapa_topsis", height = 600)),
+        # ---- PARA 2: WYKRESY RANKINGOWE ----
+        tabPanel("📊 Wykres GMI",     uiOutput("dynamic_plot_ui")),
+        tabPanel("📊 Wykres TOPSIS",
+                 br(),
+                 verbatimTextOutput("wagi_info"),
+                 uiOutput("topsis_plot_ui")),
+        # ---- PARA 3: TABELE DANYCH ----
+        tabPanel("📋 Dane GMI",       tableOutput("table")),
+        tabPanel("📋 Tabela TOPSIS",
+                 br(),
+                 p(strong("Miernik Si (C*)"),
+                   " to wskaźnik zbliżenia do ideału z przedziału [0, 1]. ",
+                   "Im bliżej 1, tym kraj bliższy wzorca (państwa maksymalnie ",
+                   "zmilitaryzowanego we wszystkich trzech wymiarach); im bliżej 0 ",
+                   "— bliższy antywzorca. Wyższy Si oznacza wyższy poziom militaryzacji."),
+                 hr(),
+                 tableOutput("topsis_table"))
+      )
+    )
+  )
+)
+
+server <- function(input, output) {
+
+  # ---- REAKTYWNE OBLICZENIE TOPSIS (na podstawie suwaków wag) ----
+  topsis_wynik <- reactive({
+    wagi <- c(input$w_exp, input$w_pers, input$w_weap)
+    if (sum(wagi) == 0) wagi <- c(1, 1, 1)   # zabezpieczenie
+    wagi <- wagi / sum(wagi)                  # normalizacja do sumy = 1
+
+    # Normalizacja unitarna (0–1)
+    norm_data <- raw_matrix %>%
+      mutate(across(where(is.numeric), ~ (. - min(.)) / (max(.) - min(.))))
+
+    # TOPSIS — wszystkie zmienne to stymulanty
+    res <- topsis(as.matrix(norm_data[, -1]), wagi, c("+", "+", "+"))
+
+    data.frame(
+      Country    = norm_data$Country,
+      Miernik_Si = round(res$score, 4),
+      Ranking    = res$rank
+    ) %>%
+      arrange(Ranking)
+  })
+
+  # ---- INFORMACJA O AKTUALNYCH WAGACH ----
+  output$wagi_info <- renderText({
+    wagi <- c(input$w_exp, input$w_pers, input$w_weap)
+    if (sum(wagi) == 0) wagi <- c(1, 1, 1)
+    wagi <- round(wagi / sum(wagi), 3)
+    paste0("Aktualne wagi (znormalizowane do sumy = 1):\n",
+           "  Wydatki wojskowe:   ", wagi[1], "\n",
+           "  Personel wojskowy:  ", wagi[2], "\n",
+           "  Ciężkie uzbrojenie: ", wagi[3])
+  })
+
+  # ============== ZAKŁADKI GMI ==============
+
+  output$mapa <- renderLeaflet({
+    req(input$wskaznik)
+    top_dane <- dane %>%
+      arrange(desc(!!sym(input$wskaznik))) %>%
+      head(input$liczba)
+
+    map_data <- world_sf %>%
+      left_join(top_dane, by = c("ID" = "Country"))
+
+    pal <- colorNumeric(palette  = "YlOrRd",
+                        domain   = dane[[input$wskaznik]],
+                        na.color = "#eeeeee")
+
+    leaflet(map_data) %>%
+      addProviderTiles(providers$CartoDB.Positron) %>%
+      setView(lng = 20, lat = 40, zoom = 2) %>%
+      addPolygons(
+        fillColor        = ~pal(get(input$wskaznik)),
+        weight           = 1, color = "white", fillOpacity = 0.8,
+        highlightOptions = highlightOptions(weight = 3, color = "#666",
+                                            bringToFront = TRUE),
+        label = ~paste0(ID, ": ",
+                        ifelse(is.na(get(input$wskaznik)),
+                               "Poza rankingiem",
+                               get(input$wskaznik)))
+      ) %>%
+      addLegend(pal = pal, values = dane[[input$wskaznik]],
+                title = "Skala", position = "bottomright")
+  })
+
+  output$dynamic_plot_ui <- renderUI({
+    plot_height <- max(400, input$liczba * 25)
+    plotOutput("plot", height = plot_height)
+  })
+
+  output$plot <- renderPlot({
+    req(input$wskaznik)
+    plot_data <- dane %>%
+      mutate(Value = as.numeric(!!sym(input$wskaznik))) %>%
+      filter(!is.na(Value)) %>%
+      arrange(desc(Value)) %>%
+      head(input$liczba)
+
+    ggplot(plot_data,
+           aes(x = reorder(Country, Value), y = Value, fill = Value)) +
+      geom_col(width = 0.7) +
+      coord_flip() +
+      scale_fill_gradient(low = "#9ecae1", high = "#084594") +
+      theme_minimal() +
+      theme(axis.text.y      = element_text(size = 10),
+            panel.grid.minor = element_blank()) +
+      labs(title = paste("Ranking GMI dla:", gsub("\\.", " ", input$wskaznik)),
+           x = "Państwo", y = "Wartość")
+  })
+
+  output$table <- renderTable({
+    req(input$wskaznik)
+    dane %>%
+      arrange(desc(!!sym(input$wskaznik))) %>%
+      head(input$liczba)
+  }, digits = 2)
+
+  # ============== ZAKŁADKI TOPSIS ==============
+
+  output$topsis_plot_ui <- renderUI({
+    plot_height <- max(400, input$liczba * 25)
+    plotOutput("topsis_plot", height = plot_height)
+  })
+
+  output$topsis_plot <- renderPlot({
+    plot_data <- topsis_wynik() %>%
+      head(input$liczba)
+
+    ggplot(plot_data,
+           aes(x = reorder(Country, Miernik_Si), y = Miernik_Si,
+               fill = Miernik_Si)) +
+      geom_col(width = 0.7) +
+      coord_flip() +
+      scale_fill_gradient(low = "#fdd49e", high = "#b30000") +
+      theme_minimal() +
+      theme(axis.text.y      = element_text(size = 10),
+            panel.grid.minor = element_blank()) +
+      labs(title = "Ranking TOPSIS (wg ustawionych wag)",
+           x = "Państwo", y = "Miernik Si (C*)")
+  })
+
+  output$mapa_topsis <- renderLeaflet({
+    ranking <- topsis_wynik() %>%
+      head(input$liczba)
+
+    map_data <- world_sf %>%
+      left_join(ranking, by = c("ID" = "Country"))
+
+    pal <- colorNumeric(palette  = "YlOrRd",
+                        domain   = topsis_wynik()$Miernik_Si,
+                        na.color = "#eeeeee")
+
+    leaflet(map_data) %>%
+      addProviderTiles(providers$CartoDB.Positron) %>%
+      setView(lng = 20, lat = 40, zoom = 2) %>%
+      addPolygons(
+        fillColor        = ~pal(Miernik_Si),
+        weight           = 1, color = "white", fillOpacity = 0.8,
+        highlightOptions = highlightOptions(weight = 3, color = "#666",
+                                            bringToFront = TRUE),
+        label = ~paste0(ID, ": ",
+                        ifelse(is.na(Miernik_Si),
+                               "Poza rankingiem",
+                               Miernik_Si))
+      ) %>%
+      addLegend(pal = pal, values = topsis_wynik()$Miernik_Si,
+                title = "Miernik Si", position = "bottomright")
+  })
+
+  output$topsis_table <- renderTable({
+    topsis_wynik() %>%
+      left_join(dane %>% select(Country, GMI.rank),
+                by = "Country") %>%
+      mutate(Roznica_rang = abs(Ranking - GMI.rank)) %>%
+      head(input$liczba) %>%
+      select(Country, Miernik_Si, Ranking, GMI.rank, Roznica_rang)
+  }, digits = 2)
+}
+
+shinyApp(ui = ui, server = server)
+```
